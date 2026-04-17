@@ -6,17 +6,15 @@ import (
 )
 
 type App struct {
-	db     *sql.DB     
+	db     *sql.DB
 	logger *log.Logger
 }
 
-
 type statusError struct {
-	Code    int    
-	Message string 
+	Code    int
+	Message string
 	Err     error
 }
-
 
 func (e *statusError) Error() string {
 	if e.Err != nil {
