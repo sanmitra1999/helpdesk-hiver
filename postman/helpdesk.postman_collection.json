@@ -1,0 +1,73 @@
+{
+  "info": {
+    "name": "Helpdesk Go API",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Create Agent",
+      "request": {
+        "method": "POST",
+        "header": [{"key": "Content-Type", "value": "application/json"}],
+        "url": {"raw": "{{baseUrl}}/agents", "host": ["{{baseUrl}}"], "path": ["agents"]},
+        "body": {"mode": "raw", "raw": "{\n  \"name\": \"Asha\",\n  \"email\": \"asha@example.com\",\n  \"skills\": [\"billing\", \"general\"],\n  \"languages\": [\"english\", \"hindi\"],\n  \"shift_start_utc\": \"00:00\",\n  \"shift_end_utc\": \"23:59\",\n  \"max_capacity\": 2,\n  \"is_online\": true\n}"}
+      }
+    },
+    {
+      "name": "Create Ticket",
+      "request": {
+        "method": "POST",
+        "header": [{"key": "Content-Type", "value": "application/json"}],
+        "url": {"raw": "{{baseUrl}}/tickets", "host": ["{{baseUrl}}"], "path": ["tickets"]},
+        "body": {"mode": "raw", "raw": "{\n  \"customer_name\": \"Ravi\",\n  \"customer_email\": \"ravi@example.com\",\n  \"category\": \"billing\",\n  \"language_preference\": \"hindi\",\n  \"priority\": \"high\"\n}"}
+      }
+    },
+    {
+      "name": "Resolve Ticket",
+      "request": {
+        "method": "PATCH",
+        "url": {"raw": "{{baseUrl}}/tickets/1/resolve", "host": ["{{baseUrl}}"], "path": ["tickets", "1", "resolve"]}
+      }
+    },
+    {
+      "name": "Reopen Ticket",
+      "request": {
+        "method": "PATCH",
+        "url": {"raw": "{{baseUrl}}/tickets/1/reopen", "host": ["{{baseUrl}}"], "path": ["tickets", "1", "reopen"]}
+      }
+    },
+    {
+      "name": "Update Agent Status",
+      "request": {
+        "method": "PATCH",
+        "header": [{"key": "Content-Type", "value": "application/json"}],
+        "url": {"raw": "{{baseUrl}}/agents/1/status", "host": ["{{baseUrl}}"], "path": ["agents", "1", "status"]},
+        "body": {"mode": "raw", "raw": "{\n  \"online\": false\n}"}
+      }
+    },
+    {
+      "name": "Get Agent Tickets",
+      "request": {
+        "method": "GET",
+        "url": {"raw": "{{baseUrl}}/agents/1/tickets", "host": ["{{baseUrl}}"], "path": ["agents", "1", "tickets"]}
+      }
+    },
+    {
+      "name": "Get Ticket Detail",
+      "request": {
+        "method": "GET",
+        "url": {"raw": "{{baseUrl}}/tickets/1", "host": ["{{baseUrl}}"], "path": ["tickets", "1"]}
+      }
+    },
+    {
+      "name": "Get Assignment Summary",
+      "request": {
+        "method": "GET",
+        "url": {"raw": "{{baseUrl}}/assignments/summary", "host": ["{{baseUrl}}"], "path": ["assignments", "summary"]}
+      }
+    }
+  ],
+  "variable": [
+    {"key": "baseUrl", "value": "http://localhost:8080"}
+  ]
+}
