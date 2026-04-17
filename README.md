@@ -199,8 +199,8 @@ Priority does not override the required skill/capacity rules, but it does contro
 
 - Move persistence to PostgreSQL with migrations.
 - Add background worker / retry scheduler instead of only retrying on state changes.
-- Add tests for shift edge cases, reopen flows, and concurrent assignment.
-- Add optimistic locking or a stronger concurrency model for multi-instance deployment.
+- Add integration tests for shift edge cases, reopen flows, and concurrent assignment under real PostgreSQL load.
+- Reduce lock scope further for higher throughput, for example with queue-claiming patterns such as `SKIP LOCKED`.
 - Add metrics and structured logs.
 - Add pagination and filtering for ticket history APIs.
 
@@ -213,6 +213,14 @@ Priority does not override the required skill/capacity rules, but it does contro
 Why
 - It matches real-time workload control and keeps routing simple.
 - It avoids artificial limits where an agent could be idle later in the shift but still blocked.
+
+## Concurrency handling
+
+- Assignment attempts run inside a PostgreSQL transaction.
+- The ticket row is locked with `FOR UPDATE` before assignment so the same ticket cannot be assigned twice concurrently.
+- Candidate agent rows are locked before checking capacity, shift, and skill eligibility.
+- The ticket update and assignment-history insert happen in the same transaction and commit together.
+- This uses pessimistic locking to keep capacity enforcement correct under concurrent requests.
 
 
 ## Priority handling
@@ -248,7 +256,7 @@ Why
 - The agent is not eligible for any new ticket assignments once out of shift.
 - Any newly pending tickets are routed only to agents who are online and currently within shift.
 - If you later mark that agent offline, their assigned tickets are unassigned and re-queued as normal.
-
+Why:
 - Preserves conversation context and ownership for already-handled customers.
 - Prevents assignment churn at shift boundaries.
 - Keeps capacity rules strict for new work while allowing graceful completion of in-flight tickets.

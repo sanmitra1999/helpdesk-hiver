@@ -1,6 +1,8 @@
 package app
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
 	"sort"
 	"strings"
@@ -35,6 +37,15 @@ type routingAgent struct {
 type pendingAssignmentEngine struct {
 	agents []*routingAgent
 }
+
+type assignmentDecision struct {
+	languageMatch bool
+	currentLoad   int
+	maxCapacity   int
+	preferred     bool
+}
+
+const agentUpdatedAtLogMessage = "error updating agent updated_at: %v"
 
 func newPendingAssignmentEngine(agents []*routingAgent) *pendingAssignmentEngine {
 	return &pendingAssignmentEngine{agents: agents}
@@ -82,8 +93,6 @@ func (e *pendingAssignmentEngine) selectAgent(category, language string) (*routi
 // processPending finds all unassigned and reopened tickets and attempts to assign them to available agents.
 // Tickets are processed in priority order (urgent first) and then by creation time.
 func (a *App) processPending() error {
-	now := time.Now().UTC()
-
 	pendingTickets, err := a.fetchPendingTickets()
 	if err != nil {
 		return err
@@ -91,26 +100,9 @@ func (a *App) processPending() error {
 	if len(pendingTickets) == 0 {
 		return nil
 	}
-
-	agents, err := a.fetchRoutingAgents(now)
-	if err != nil {
-		return err
-	}
-
-	engine := newPendingAssignmentEngine(agents)
 	for _, ticket := range pendingTickets {
-		agent, ok := engine.selectAgent(ticket.category, ticket.language)
-		if !ok {
-			a.addEvent(ticket.id, nil, "pending", "no eligible agent available right now; ticket kept in unassigned queue")
-			continue
-		}
-
-		loadBefore := agent.currentLoad
-		agentID := agent.id
-		assigned, _ := a.applyAssignmentWithContext(ticket.id, agentID, ticket.language, agent.languageMatched, loadBefore, agent.maxCapacity, now)
-		if assigned {
-			agent.currentLoad++
-		}
+		now := time.Now().UTC()
+		_, _ = a.assignTicket(ticket.id, ticket.customerEmail, ticket.category, ticket.language, ticket.priority, now)
 	}
 
 	return nil
@@ -196,13 +188,53 @@ func (a *App) fetchRoutingAgents(now time.Time) ([]*routingAgent, error) {
 // assignTicketWithPreference attempts to assign a reopened ticket to its previous agent first.
 // If the previous agent cannot take it (offline, out of shift, over capacity), falls back to normal routing.
 func (a *App) assignTicketWithPreference(ticketID int64, category, language string, preferredAgentID *int64, now time.Time) (bool, *int64) {
-	if preferredAgentID != nil && a.canTake(*preferredAgentID, category) {
-		ok, id := a.applyPreferredAssignment(ticketID, *preferredAgentID, language, now)
+	tx, err := a.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		a.logger.Printf("error starting assignment transaction for ticket %d: %v", ticketID, err)
+		return false, nil
+	}
+
+	status, err := lockTicketForAssignment(tx, ticketID)
+	if err != nil {
+		_ = tx.Rollback()
+		a.logger.Printf("error locking ticket %d for preferred assignment: %v", ticketID, err)
+		return false, nil
+	}
+	if !isAssignableStatus(status) {
+		if err := tx.Commit(); err != nil {
+			a.logger.Printf("error finishing assignment transaction for ticket %d: %v", ticketID, err)
+		}
+		return false, nil
+	}
+
+	if preferredAgentID != nil {
+		ok, id, err := a.tryPreferredAssignmentTx(tx, ticketID, *preferredAgentID, category, language, now)
+		if err != nil {
+			_ = tx.Rollback()
+			a.logger.Printf("error assigning ticket %d to preferred agent %d: %v", ticketID, *preferredAgentID, err)
+			return false, nil
+		}
 		if ok {
-			return ok, id
+			if err := tx.Commit(); err != nil {
+				a.logger.Printf("error committing preferred assignment for ticket %d: %v", ticketID, err)
+				return false, nil
+			}
+			return true, id
 		}
 	}
-	return a.assignTicket(ticketID, "", category, language, "", now)
+
+	assigned, agentID, err := a.assignTicketLockedTx(tx, ticketID, category, language, now)
+	if err != nil {
+		_ = tx.Rollback()
+		a.logger.Printf("error assigning reopened ticket %d: %v", ticketID, err)
+		return false, nil
+	}
+	if err := tx.Commit(); err != nil {
+		a.logger.Printf("error committing assignment for ticket %d: %v", ticketID, err)
+		return false, nil
+	}
+
+	return assigned, agentID
 }
 
 // applyPreferredAssignment assigns a reopened ticket back to its previous agent and records it as a preferred assignment.
@@ -230,7 +262,7 @@ func (a *App) applyPreferredAssignment(ticketID, agentID int64, language string,
 
 	_, err = a.db.Exec(`UPDATE agents SET updated_at = $1 WHERE id = $2`, now, agentID)
 	if err != nil {
-		a.logger.Printf("error updating agent updated_at: %v", err)
+		a.logger.Printf(agentUpdatedAtLogMessage, err)
 	}
 
 	reason := assignmentReason(languageMatch, currentLoad, maxCapacity, true)
@@ -242,20 +274,191 @@ func (a *App) applyPreferredAssignment(ticketID, agentID int64, language string,
 // assignTicket attempts to assign a ticket to the best available agent based on skills, language preference, and capacity.
 // Returns true and the assigned agent ID if successful, false and nil if no agent is available.
 func (a *App) assignTicket(ticketID int64, customerEmail, category, language, priority string, now time.Time) (bool, *int64) {
-	candidates, err := a.getOrderedCandidates(category, language)
+	tx, err := a.db.BeginTx(context.Background(), nil)
 	if err != nil {
-		a.logger.Printf("error getting candidates for ticket %d: %v", ticketID, err)
+		a.logger.Printf("error starting assignment transaction for ticket %d: %v", ticketID, err)
 		return false, nil
 	}
 
-	for _, candidate := range candidates {
-		if a.canTake(candidate.ID, category) {
-			return a.applyAssignment(ticketID, candidate.ID, category, language, now)
+	status, err := lockTicketForAssignment(tx, ticketID)
+	if err != nil {
+		_ = tx.Rollback()
+		a.logger.Printf("error locking ticket %d for assignment: %v", ticketID, err)
+		return false, nil
+	}
+	if !isAssignableStatus(status) {
+		if err := tx.Commit(); err != nil {
+			a.logger.Printf("error finishing assignment transaction for ticket %d: %v", ticketID, err)
 		}
+		return false, nil
 	}
 
-	a.addEvent(ticketID, nil, "pending", fmt.Sprintf("no eligible agent available right now; ticket kept in unassigned queue"))
-	return false, nil
+	assigned, agentID, err := a.assignTicketLockedTx(tx, ticketID, category, language, now)
+	if err != nil {
+		_ = tx.Rollback()
+		a.logger.Printf("error assigning ticket %d: %v", ticketID, err)
+		return false, nil
+	}
+	if err := tx.Commit(); err != nil {
+		a.logger.Printf("error committing assignment for ticket %d: %v", ticketID, err)
+		return false, nil
+	}
+
+	return assigned, agentID
+}
+
+func (a *App) assignTicketLockedTx(tx *sql.Tx, ticketID int64, category, language string, now time.Time) (bool, *int64, error) {
+	agents, err := fetchRoutingAgentsForUpdate(tx, now)
+	if err != nil {
+		return false, nil, err
+	}
+
+	engine := newPendingAssignmentEngine(agents)
+	agent, ok := engine.selectAgent(category, language)
+	if !ok {
+		if err := addEventWithExecutor(tx, ticketID, nil, "pending", "no eligible agent available right now; ticket kept in unassigned queue", time.Now().UTC()); err != nil {
+			return false, nil, err
+		}
+		return false, nil, nil
+	}
+
+	return applyAssignmentWithExecutor(tx, ticketID, agent.id, assignmentDecision{
+		languageMatch: agent.languageMatched,
+		currentLoad:   agent.currentLoad,
+		maxCapacity:   agent.maxCapacity,
+		preferred:     false,
+	}, now)
+}
+
+func lockTicketForAssignment(tx *sql.Tx, ticketID int64) (string, error) {
+	var status string
+	err := tx.QueryRow(`SELECT status FROM tickets WHERE id = $1 FOR UPDATE`, ticketID).Scan(&status)
+	return status, err
+}
+
+func isAssignableStatus(status string) bool {
+	return status == "unassigned" || status == "reopened"
+}
+
+func fetchRoutingAgentsForUpdate(tx *sql.Tx, now time.Time) ([]*routingAgent, error) {
+	rows, err := tx.Query(`
+		SELECT id, skills, languages, shift_start_minutes, shift_end_minutes, max_capacity,
+		       (
+			   SELECT COUNT(*)
+			   FROM tickets
+			   WHERE current_agent_id = agents.id AND status = 'assigned'
+		       ) AS current_load
+		FROM agents
+		WHERE is_online = true
+		ORDER BY id
+		FOR UPDATE
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	agents := make([]*routingAgent, 0)
+	for rows.Next() {
+		agent := &routingAgent{}
+		err := rows.Scan(&agent.id, pq.Array(&agent.categorySkills), pq.Array(&agent.languages), &agent.shiftStartMin, &agent.shiftEndMin, &agent.maxCapacity, &agent.currentLoad)
+		if err != nil {
+			return nil, err
+		}
+		agent.withinShift = withinShift(agent.shiftStartMin, agent.shiftEndMin, now)
+		if !agent.withinShift {
+			continue
+		}
+		if agent.currentLoad >= agent.maxCapacity {
+			continue
+		}
+
+		agents = append(agents, agent)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return agents, nil
+}
+
+func (a *App) tryPreferredAssignmentTx(tx *sql.Tx, ticketID, agentID int64, category, language string, now time.Time) (bool, *int64, error) {
+	var isOnline bool
+	var shiftStartMin, shiftEndMin int
+	var maxCapacity, currentLoad int
+	var skills, languages []string
+
+	err := tx.QueryRow(`
+		SELECT is_online, shift_start_minutes, shift_end_minutes, max_capacity, skills, languages
+		FROM agents
+		WHERE id = $1
+		FOR UPDATE
+	`, agentID).Scan(&isOnline, &shiftStartMin, &shiftEndMin, &maxCapacity, pq.Array(&skills), pq.Array(&languages))
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return false, nil, nil
+		}
+		return false, nil, err
+	}
+
+	if !isOnline || !withinShift(shiftStartMin, shiftEndMin, now) || !contains(skills, category) {
+		return false, nil, nil
+	}
+
+	err = tx.QueryRow(`
+		SELECT COUNT(*)
+		FROM tickets
+		WHERE current_agent_id = $1 AND status = 'assigned'
+	`, agentID).Scan(&currentLoad)
+	if err != nil {
+		return false, nil, err
+	}
+	if currentLoad >= maxCapacity {
+		return false, nil, nil
+	}
+
+	return applyAssignmentWithExecutor(tx, ticketID, agentID, assignmentDecision{
+		languageMatch: contains(languages, language),
+		currentLoad:   currentLoad,
+		maxCapacity:   maxCapacity,
+		preferred:     true,
+	}, now)
+}
+
+type sqlExecutor interface {
+	Exec(query string, args ...any) (sql.Result, error)
+	Query(query string, args ...any) (*sql.Rows, error)
+	QueryRow(query string, args ...any) *sql.Row
+}
+
+func applyAssignmentWithExecutor(exec sqlExecutor, ticketID, agentID int64, decision assignmentDecision, now time.Time) (bool, *int64, error) {
+	_, err := exec.Exec(`
+		UPDATE tickets SET current_agent_id = $1, status = 'assigned', assigned_at = $2, updated_at = $3 WHERE id = $4
+	`, agentID, now, now, ticketID)
+	if err != nil {
+		return false, nil, err
+	}
+
+	_, err = exec.Exec(`UPDATE agents SET updated_at = $1 WHERE id = $2`, now, agentID)
+	if err != nil {
+		return false, nil, err
+	}
+
+	reason := assignmentReason(decision.languageMatch, decision.currentLoad, decision.maxCapacity, decision.preferred)
+	if err := addEventWithExecutor(exec, ticketID, &agentID, "assigned", reason, time.Now().UTC()); err != nil {
+		return false, nil, err
+	}
+
+	return true, &agentID, nil
+}
+
+func addEventWithExecutor(exec sqlExecutor, ticketID int64, agentID *int64, eventType, reason string, createdAt time.Time) error {
+	_, err := exec.Exec(
+		`INSERT INTO assignments (ticket_id, agent_id, event_type, reason, created_at)
+		 VALUES ($1, $2, $3, $4, $5)`,
+		ticketID, agentID, eventType, reason, createdAt,
+	)
+	return err
 }
 
 // getOrderedCandidates finds all available agents who can handle the given category and language.
@@ -330,11 +533,6 @@ func (a *App) getOrderedCandidates(category, language string) ([]models.AgentSum
 // canTake determines if an agent can accept a ticket assignment.
 // Checks agent availability (online status, shift time), skill compatibility,
 // and current workload capacity.
-// Parameters:
-//   - agentID: the agent's unique identifier
-//   - category: the ticket's skill category requirement
-//
-// Returns true if the agent can take the ticket, false otherwise.
 func (a *App) canTake(agentID int64, category string) bool {
 	var isOnline bool
 	var shiftStartMin, shiftEndMin int
@@ -374,16 +572,6 @@ func (a *App) canTake(agentID int64, category string) bool {
 
 // applyAssignment assigns a ticket to an agent and records the assignment.
 // Updates the ticket status, agent's last assignment time, and creates an audit event.
-// Parameters:
-//   - ticketID: the ticket to assign
-//   - agentID: the agent receiving the assignment
-//   - category: ticket's skill category (for logging)
-//   - language: ticket's language preference
-//   - now: timestamp for the assignment
-//
-// Returns:
-//   - bool: true if assignment succeeded
-//   - *int64: pointer to assigned agent ID, or nil on failure
 func (a *App) applyAssignment(ticketID, agentID int64, category, language string, now time.Time) (bool, *int64) {
 	var agentName, agentEmail string
 	var languages []string
@@ -409,7 +597,7 @@ func (a *App) applyAssignment(ticketID, agentID int64, category, language string
 
 	_, err = a.db.Exec(`UPDATE agents SET updated_at = $1 WHERE id = $2`, now, agentID)
 	if err != nil {
-		a.logger.Printf("error updating agent updated_at: %v", err)
+		a.logger.Printf(agentUpdatedAtLogMessage, err)
 	}
 
 	reason := assignmentReason(languageMatch, currentLoad, maxCapacity, false)
@@ -430,7 +618,7 @@ func (a *App) applyAssignmentWithContext(ticketID, agentID int64, language strin
 
 	_, err = a.db.Exec(`UPDATE agents SET updated_at = $1 WHERE id = $2`, now, agentID)
 	if err != nil {
-		a.logger.Printf("error updating agent updated_at: %v", err)
+		a.logger.Printf(agentUpdatedAtLogMessage, err)
 	}
 
 	reason := assignmentReason(languageMatch, currentLoad, maxCapacity, false)
@@ -441,17 +629,8 @@ func (a *App) applyAssignmentWithContext(ticketID, agentID int64, language strin
 
 // addEvent records an assignment event in the audit log.
 // Creates a record of ticket state changes for tracking and debugging.
-// Parameters:
-//   - ticketID: the ticket involved in the event
-//   - agentID: the agent involved (may be nil for system events)
-//   - eventType: type of event ("assigned", "unassigned", etc.)
-//   - reason: human-readable explanation of the event
 func (a *App) addEvent(ticketID int64, agentID *int64, eventType, reason string) {
-	_, err := a.db.Exec(
-		`INSERT INTO assignments (ticket_id, agent_id, event_type, reason, created_at)
-		 VALUES ($1, $2, $3, $4, $5)`,
-		ticketID, agentID, eventType, reason, time.Now().UTC(),
-	)
+	err := addEventWithExecutor(a.db, ticketID, agentID, eventType, reason, time.Now().UTC())
 	if err != nil {
 		a.logger.Printf("error adding event: %v", err)
 	}
@@ -459,13 +638,6 @@ func (a *App) addEvent(ticketID int64, agentID *int64, eventType, reason string)
 
 // assignmentReason generates a human-readable explanation for why a ticket was assigned to an agent.
 // Combines multiple factors into a semicolon-separated string for audit logging.
-// Parameters:
-//   - languageMatch: whether the agent's languages matched the ticket's language preference
-//   - currentLoadBefore: agent's ticket count before assignment
-//   - maxCapacity: agent's maximum concurrent ticket capacity
-//   - preferred: whether this was a preferred agent assignment (e.g., for reopened tickets)
-//
-// Returns a descriptive string explaining the assignment decision.
 func assignmentReason(languageMatch bool, currentLoadBefore, maxCapacity int, preferred bool) string {
 	parts := []string{}
 	if preferred {

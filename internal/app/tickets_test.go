@@ -232,12 +232,20 @@ func TestReopenTicket_SuccessWithoutPreviousAgentFallsBackToNormalRouting(t *tes
 		WithArgs(int64(302), nil, "reopened", "ticket reopened; system will try the previous agent first and then fallback to normal routing", sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
-	mock.ExpectQuery(`SELECT a.id, a.name, a.email, a.skills, a.languages, a.shift_start_minutes, a.shift_end_minutes,`).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "email", "skills", "languages", "shift_start_minutes", "shift_end_minutes", "max_capacity", "current_load"}))
+	mock.ExpectBegin()
+
+	mock.ExpectQuery(`SELECT status FROM tickets WHERE id = \$1 FOR UPDATE`).
+		WithArgs(int64(302)).
+		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("reopened"))
+
+	mock.ExpectQuery(`SELECT id, skills, languages, shift_start_minutes, shift_end_minutes, max_capacity`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "skills", "languages", "shift_start_minutes", "shift_end_minutes", "max_capacity"}))
 
 	mock.ExpectExec(`INSERT INTO assignments`).
 		WithArgs(int64(302), nil, "pending", "no eligible agent available right now; ticket kept in unassigned queue", sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	mock.ExpectCommit()
 
 	resp, err := a.ReopenTicket(302)
 	if err != nil {

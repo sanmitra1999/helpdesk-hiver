@@ -21,8 +21,9 @@ func main() {
 	logger := log.New(os.Stdout, "helpdesk ", log.LstdFlags|log.LUTC|log.Lshortfile)
 
 	port := getenv("PORT", "8080")
+	dbHost := getenv("DB_HOST", "localhost")
 
-	database, err := db.OpenDB("localhost", "postgres", "password", "helpdesk", 5432)
+	database, err := db.OpenDB(dbHost, "postgres", "password", "helpdesk", 5432)
 	if err != nil {
 		logger.Fatalf("failed to connect to database: %v", err)
 	}

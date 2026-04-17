@@ -5,10 +5,12 @@ services:
       dockerfile: Dockerfile
     environment:
       PORT: 8080
+      DB_HOST: postgres
     ports:
       - "8080:8080"
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     networks:
       - helpdesk
 
@@ -24,6 +26,11 @@ services:
       - postgres_data:/var/lib/postgresql/data
     networks:
       - helpdesk
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
 volumes:
   postgres_data:

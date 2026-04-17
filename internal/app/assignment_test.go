@@ -107,21 +107,19 @@ func TestAssignTicketWithPreference_PrefersPreviousAgent(t *testing.T) {
 	preferredID := int64(7)
 	now := time.Now().UTC()
 
-	mock.ExpectQuery(`SELECT is_online, shift_start_minutes, shift_end_minutes, skills`).
+	mock.ExpectBegin()
+
+	mock.ExpectQuery(`SELECT status FROM tickets WHERE id = \$1 FOR UPDATE`).
+		WithArgs(int64(2001)).
+		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("reopened"))
+
+	mock.ExpectQuery(`SELECT is_online, shift_start_minutes, shift_end_minutes, max_capacity, skills, languages`).
 		WithArgs(preferredID).
-		WillReturnRows(sqlmock.NewRows([]string{"is_online", "shift_start_minutes", "shift_end_minutes", "skills"}).AddRow(true, 0, 0, "{billing}"))
+		WillReturnRows(sqlmock.NewRows([]string{"is_online", "shift_start_minutes", "shift_end_minutes", "max_capacity", "skills", "languages"}).AddRow(true, 0, 0, 3, "{billing}", "{english,hindi}"))
 
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM tickets WHERE current_agent_id = \$1 AND status = 'assigned'`).
 		WithArgs(preferredID).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
-
-	mock.ExpectQuery(`SELECT max_capacity FROM agents WHERE id = \$1`).
-		WithArgs(preferredID).
-		WillReturnRows(sqlmock.NewRows([]string{"max_capacity"}).AddRow(3))
-
-	mock.ExpectQuery(`SELECT languages, max_capacity,`).
-		WithArgs(preferredID).
-		WillReturnRows(sqlmock.NewRows([]string{"languages", "max_capacity", "current_load"}).AddRow("{english,hindi}", 3, 1))
 
 	mock.ExpectExec(`UPDATE tickets SET current_agent_id = \$1, status = 'assigned', assigned_at = \$2, updated_at = \$3 WHERE id = \$4`).
 		WithArgs(preferredID, now, now, int64(2001)).
@@ -134,6 +132,8 @@ func TestAssignTicketWithPreference_PrefersPreviousAgent(t *testing.T) {
 	mock.ExpectExec(`INSERT INTO assignments`).
 		WithArgs(int64(2001), preferredID, "assigned", sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	mock.ExpectCommit()
 
 	assigned, agentID := a.assignTicketWithPreference(2001, "billing", "english", &preferredID, now)
 	if !assigned {
@@ -158,12 +158,20 @@ func TestAssignTicket_NoCandidatesAddsPendingEvent(t *testing.T) {
 	a := &App{db: db, logger: log.New(io.Discard, "", 0)}
 	now := time.Now().UTC()
 
-	mock.ExpectQuery(`SELECT a.id, a.name, a.email, a.skills, a.languages, a.shift_start_minutes, a.shift_end_minutes,`).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "email", "skills", "languages", "shift_start_minutes", "shift_end_minutes", "max_capacity", "current_load"}))
+	mock.ExpectBegin()
+
+	mock.ExpectQuery(`SELECT status FROM tickets WHERE id = \$1 FOR UPDATE`).
+		WithArgs(int64(3001)).
+		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("unassigned"))
+
+	mock.ExpectQuery(`SELECT id, skills, languages, shift_start_minutes, shift_end_minutes, max_capacity`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "skills", "languages", "shift_start_minutes", "shift_end_minutes", "max_capacity"}))
 
 	mock.ExpectExec(`INSERT INTO assignments`).
 		WithArgs(int64(3001), nil, "pending", "no eligible agent available right now; ticket kept in unassigned queue", sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	mock.ExpectCommit()
 
 	assigned, agentID := a.assignTicket(3001, "customer@example.com", "billing", "english", "high", now)
 	if assigned {

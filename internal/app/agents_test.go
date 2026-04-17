@@ -94,7 +94,7 @@ func TestCreateAgent_OnlineTriggersPendingProcessing(t *testing.T) {
 	}
 }
 
-func TestUpdateAgentStatus_OfflineRequeuesAssignedTickets(t *testing.T) {
+func TestUpdateAgentStatus_OfflineRequeuestAssignedTickets(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("failed to create sqlmock: %v", err)
